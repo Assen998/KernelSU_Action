@@ -104,10 +104,19 @@ retry() {
 # ------------------------------------------------------------- downloading ---
 
 # fetch URL DEST -- resumable, retrying download.
+#
+# The AOSP gitiles '+archive' endpoint is slow and flaky: it generates
+# multi-gigabyte tarballs on the fly and intermittently answers 503 or hangs
+# mid-transfer. Observed 2026-09-28 on the same URL: a whole build run failed
+# after 4 attempts, then a retry minutes later succeeded. So:
+#   * more outer attempts (retry 6),
+#   * curl-level retries for transient HTTP errors (--retry 5),
+#   * a per-attempt cap so a hung generation cannot eat the job timeout.
 fetch() {
 	local url=$1 dest=$2
 	info "fetching ${url}"
-	retry 4 curl -fsSL --connect-timeout 30 --retry 3 --retry-delay 3 -o "$dest" "$url" \
+	retry 6 curl -fsSL --connect-timeout 30 --retry 5 --retry-delay 5 \
+		--max-time 900 -o "$dest" "$url" \
 		|| die "failed to download ${url}"
 	[ -s "$dest" ] || die "downloaded file is empty: ${url}"
 }
