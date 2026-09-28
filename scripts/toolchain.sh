@@ -60,6 +60,19 @@ clang_known_good() {
 	esac
 }
 
+# gitiles_alive REPO_URL -- 0 if the gitiles web frontend answers 2xx, 1 if
+# it is refusing (the multi-hour 503 outage mode, in which *every* request to
+# the service 503s within a second). A cheap 15s probe, used to skip straight
+# to the fallbacks instead of burning minutes of retries on a dead endpoint.
+gitiles_alive() {
+	local code
+	code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$1" 2>/dev/null) || return 1
+	case "$code" in
+		2*) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
 # find_clang_bin DIR -- print the path to a usable clang inside an extracted
 # toolchain tree. Handles the AOSP layout (bin/clang at the tree root) and the
 # NDK layout (<root>/toolchains/llvm/prebuilt/linux-x86_64/bin/clang).
@@ -79,13 +92,14 @@ find_clang_bin() {
 
 # setup_clang_ndk_fallback DEST -- download the NDK zip (static CDN object)
 # and leave its extracted tree in DEST. Returns 1 when it cannot provide a
-# clang; the caller decides what to do.
+# clang; the caller decides what to do. The fetch runs in a subshell because
+# fetch() hard-exits on failure (die) and that must not take this script down.
 setup_clang_ndk_fallback() {
 	local dest=$1
 	group "Fallback: NDK ${NDK_FALLBACK_VERSION} from dl.google.com"
 	local zip="${WORKSPACE}/ndk-${NDK_FALLBACK_VERSION}.zip"
 	rm -rf "$dest"; mkdir -p "$dest"
-	fetch "$NDK_FALLBACK_URL" "$zip" \
+	( fetch "$NDK_FALLBACK_URL" "$zip" ) \
 		|| { warn "NDK download failed: ${NDK_FALLBACK_URL}"; return 1; }
 	extract_archive "$zip" "$dest"
 	find_clang_bin "$dest" >/dev/null
@@ -133,18 +147,45 @@ setup_clang() {
 		fi
 
 		local aosp_url="${AOSP_CLANG_BASE}/+archive/refs/heads/${branch}/clang-${version}.tar.gz"
-		if fetch "$aosp_url" "${WORKSPACE}/clang.tar.gz" \
-			&& extract_archive "${WORKSPACE}/clang.tar.gz" "$CLANG_DIR" \
-			&& clang_bin=$(find_clang_bin "$CLANG_DIR"); then
-			:
+		# fetch() hard-exits (die) on failure, so every AOSP attempt runs in a
+		# subshell: its exit stays inside the subshell and the fallback chain
+		# below still gets its turn.
+		local dl_ok=false
+		if gitiles_alive "$AOSP_CLANG_BASE"; then
+			( fetch "$aosp_url" "${WORKSPACE}/clang.tar.gz" \
+				&& extract_archive "${WORKSPACE}/clang.tar.gz" "$CLANG_DIR" ) \
+				&& dl_ok=true
 		else
-			warn "AOSP clang unavailable (gitiles outage or empty archive). Retrying once, then falling back."
+			warn "gitiles is refusing requests (503 outage mode); skipping AOSP clang download."
+		fi
+		if [ "$dl_ok" = true ]; then
+			# Empty-archive trap: an unpopulated version directory downloads as
+			# a valid ~165-byte tarball. A real toolchain is ~2GB.
+			local size
+			size=$(stat -c%s "${WORKSPACE}/clang.tar.gz" 2>/dev/null || echo 0)
+			[ "$size" -gt 1048576 ] \
+				|| die "downloaded clang archive is only ${size} bytes: ${branch}/${version} is an empty placeholder.
+        Pick a verified pair (see scripts/toolchain.sh)."
+			clang_bin=$(find_clang_bin "$CLANG_DIR") || clang_bin=""
+		fi
+
+		if [ -z "$clang_bin" ] && gitiles_alive "$AOSP_CLANG_BASE"; then
+			warn "retrying AOSP clang once in case the outage flapped..."
 			rm -rf "$CLANG_DIR"; mkdir -p "$CLANG_DIR"
-			if fetch "$aosp_url" "${WORKSPACE}/clang.tar.gz" \
-				&& extract_archive "${WORKSPACE}/clang.tar.gz" "$CLANG_DIR" \
-				&& clang_bin=$(find_clang_bin "$CLANG_DIR"); then
-				:
-			elif setup_clang_ndk_fallback "$CLANG_DIR" \
+			( fetch "$aosp_url" "${WORKSPACE}/clang.tar.gz" \
+				&& extract_archive "${WORKSPACE}/clang.tar.gz" "$CLANG_DIR" ) \
+				&& dl_ok=true
+			if [ "$dl_ok" = true ]; then
+				size=$(stat -c%s "${WORKSPACE}/clang.tar.gz" 2>/dev/null || echo 0)
+				[ "$size" -gt 1048576 ] \
+					|| die "downloaded clang archive is only ${size} bytes: ${branch}/${version} is an empty placeholder.
+        Pick a verified pair (see scripts/toolchain.sh)."
+				clang_bin=$(find_clang_bin "$CLANG_DIR") || clang_bin=""
+			fi
+		fi
+
+		if [ -z "$clang_bin" ]; then
+			if setup_clang_ndk_fallback "$CLANG_DIR" \
 				&& clang_bin=$(find_clang_bin "$CLANG_DIR"); then
 				warn "using NDK ${NDK_FALLBACK_VERSION} toolchain (Clang 16) instead of AOSP clang ${version}."
 			fi
@@ -178,14 +219,21 @@ setup_gcc() {
 		endgroup
 	elif is_true "${ENABLE_GCC_ARM64:-false}"; then
 		group "Downloading AOSP GCC (arm64)"
+		local repo64="https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9"
+		local url64="${repo64}/+archive/refs/tags/${gcc_tag}.tar.gz"
+		local ok64=false
 		mkdir -p "$GCC64_DIR"
-		if fetch "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/${gcc_tag}.tar.gz" \
-			"${WORKSPACE}/gcc-aarch64.tar.gz" \
-			&& extract_archive "${WORKSPACE}/gcc-aarch64.tar.gz" "$GCC64_DIR" \
-			&& [ -x "${GCC64_DIR}/bin/aarch64-linux-android-ld" ]; then
+		if gitiles_alive "$repo64"; then
+			( fetch "$url64" "${WORKSPACE}/gcc-aarch64.tar.gz" \
+				&& extract_archive "${WORKSPACE}/gcc-aarch64.tar.gz" "$GCC64_DIR" ) \
+				&& ok64=true
+		else
+			warn "gitiles is refusing requests (503 outage mode); skipping AOSP GCC (arm64) download."
+		fi
+		if [ "$ok64" = true ] && [ -x "${GCC64_DIR}/bin/aarch64-linux-android-ld" ]; then
 			export_env GCC_64 "CROSS_COMPILE=${GCC64_DIR}/bin/aarch64-linux-android-"
 		else
-			warn "AOSP GCC (arm64) unavailable (gitiles outage?). Using system aarch64-linux-gnu binutils."
+			warn "AOSP GCC (arm64) unavailable. Using system aarch64-linux-gnu binutils."
 			if ! command -v aarch64-linux-gnu-ld >/dev/null 2>&1; then
 				sudo apt-get update -qq || true
 				sudo apt-get install -y --no-install-recommends binutils-aarch64-linux-gnu \
@@ -203,14 +251,21 @@ setup_gcc() {
 		endgroup
 	elif is_true "${ENABLE_GCC_ARM32:-false}"; then
 		group "Downloading AOSP GCC (arm32)"
+		local repo32="https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9"
+		local url32="${repo32}/+archive/refs/tags/${gcc_tag}.tar.gz"
+		local ok32=false
 		mkdir -p "$GCC32_DIR"
-		if fetch "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9/+archive/refs/tags/${gcc_tag}.tar.gz" \
-			"${WORKSPACE}/gcc-arm.tar.gz" \
-			&& extract_archive "${WORKSPACE}/gcc-arm.tar.gz" "$GCC32_DIR" \
-			&& [ -x "${GCC32_DIR}/bin/arm-linux-androideabi-ld" ]; then
+		if gitiles_alive "$repo32"; then
+			( fetch "$url32" "${WORKSPACE}/gcc-arm.tar.gz" \
+				&& extract_archive "${WORKSPACE}/gcc-arm.tar.gz" "$GCC32_DIR" ) \
+				&& ok32=true
+		else
+			warn "gitiles is refusing requests (503 outage mode); skipping AOSP GCC (arm32) download."
+		fi
+		if [ "$ok32" = true ] && [ -x "${GCC32_DIR}/bin/arm-linux-androideabi-ld" ]; then
 			export_env GCC_32 "CROSS_COMPILE_ARM32=${GCC32_DIR}/bin/arm-linux-androideabi-"
 		else
-			warn "AOSP GCC (arm32) unavailable (gitiles outage?). Using system arm-linux-gnueabi binutils."
+			warn "AOSP GCC (arm32) unavailable. Using system arm-linux-gnueabi binutils."
 			if ! command -v arm-linux-gnueabi-ld >/dev/null 2>&1; then
 				sudo apt-get install -y --no-install-recommends binutils-arm-linux-gnueabi \
 					|| die "cannot install binutils-arm-linux-gnueabi"
