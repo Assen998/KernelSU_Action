@@ -75,14 +75,15 @@ gitiles_alive() {
 
 # find_clang_bin DIR -- print the path to a usable clang inside an extracted
 # toolchain tree. Handles the AOSP layout (bin/clang at the tree root) and the
-# NDK layout (<root>/toolchains/llvm/prebuilt/linux-x86_64/bin/clang).
+# NDK layout (<root>/toolchains/llvm/prebuilt/linux-x86_64/bin/clang). Note the
+# NDK's bin/clang is a SYMLINK (clang -> clang-16), so -type f alone misses it.
 find_clang_bin() {
 	local root=$1 cand
 	if [ -x "${root}/bin/clang" ]; then
 		printf '%s' "${root}/bin/clang"
 		return 0
 	fi
-	cand=$(find "$root" -maxdepth 7 -type f -path '*/bin/clang' 2>/dev/null | awk 'NR==1')
+	cand=$(find "$root" -maxdepth 7 \( -type f -o -type l \) -path '*/bin/clang' 2>/dev/null | awk 'NR==1')
 	if [ -n "$cand" ] && [ -x "$cand" ]; then
 		printf '%s' "$cand"
 		return 0
