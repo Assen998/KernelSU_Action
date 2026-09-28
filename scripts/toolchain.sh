@@ -13,6 +13,18 @@ GCC32_DIR="${WORKSPACE}/gcc-32"
 
 AOSP_CLANG_BASE="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86"
 
+# Fallback sources. android.googlesource.com's gitiles '+archive' endpoint
+# generates multi-GB tarballs on the fly and has had multi-hour outages in
+# which every request returns 503 (observed 2026-09-28, from both GitHub
+# runners and other networks). The fallbacks below use hosts that do not
+# generate anything on the fly:
+#   * the NDK zip on dl.google.com is a static CDN object (Clang 16 in r25c,
+#     same generation LineageOS CI uses for maintained legacy trees),
+#   * the runner image ships GNU cross binutils (apt packages), the exact
+#     tool generation 4.4/4.9 trees were historically built with.
+NDK_FALLBACK_VERSION=${CLANG_NDK_VERSION:-r25c}
+NDK_FALLBACK_URL="https://dl.google.com/android/repository/android-ndk-${NDK_FALLBACK_VERSION}-linux.zip"
+
 # Known-good AOSP clang branch/version pairs, verified 2026-07-27.
 #
 # This table exists because the AOSP prebuilt repo is a minefield: every
@@ -48,9 +60,41 @@ clang_known_good() {
 	esac
 }
 
+# find_clang_bin DIR -- print the path to a usable clang inside an extracted
+# toolchain tree. Handles the AOSP layout (bin/clang at the tree root) and the
+# NDK layout (<root>/toolchains/llvm/prebuilt/linux-x86_64/bin/clang).
+find_clang_bin() {
+	local root=$1 cand
+	if [ -x "${root}/bin/clang" ]; then
+		printf '%s' "${root}/bin/clang"
+		return 0
+	fi
+	cand=$(find "$root" -maxdepth 7 -type f -path '*/bin/clang' 2>/dev/null | awk 'NR==1')
+	if [ -n "$cand" ] && [ -x "$cand" ]; then
+		printf '%s' "$cand"
+		return 0
+	fi
+	return 1
+}
+
+# setup_clang_ndk_fallback DEST -- download the NDK zip (static CDN object)
+# and leave its extracted tree in DEST. Returns 1 when it cannot provide a
+# clang; the caller decides what to do.
+setup_clang_ndk_fallback() {
+	local dest=$1
+	group "Fallback: NDK ${NDK_FALLBACK_VERSION} from dl.google.com"
+	local zip="${WORKSPACE}/ndk-${NDK_FALLBACK_VERSION}.zip"
+	rm -rf "$dest"; mkdir -p "$dest"
+	fetch "$NDK_FALLBACK_URL" "$zip" \
+		|| { warn "NDK download failed: ${NDK_FALLBACK_URL}"; return 1; }
+	extract_archive "$zip" "$dest"
+	find_clang_bin "$dest" >/dev/null
+}
+
 setup_clang() {
 	rm -rf "$CLANG_DIR"; mkdir -p "$CLANG_DIR"
 
+	local clang_bin=""
 	if is_true "${USE_CUSTOM_CLANG:-false}"; then
 		group "Downloading custom Clang"
 		local src=${CUSTOM_CLANG_SOURCE:?CUSTOM_CLANG_SOURCE required}
@@ -71,6 +115,9 @@ setup_clang() {
 				fetch "$src" "${WORKSPACE}/clang.zip"
 				extract_archive "${WORKSPACE}/clang.zip" "$CLANG_DIR" ;;
 		esac
+		clang_bin=$(find_clang_bin "$CLANG_DIR") \
+			|| die "no usable clang found under ${CLANG_DIR} after custom download.
+        The archive extracted to: $(ls -A "$CLANG_DIR" 2>/dev/null | awk 'NR<=5' | tr '\n' ' ')"
 	else
 		group "Downloading AOSP Clang"
 		local branch=${CLANG_BRANCH:-main-kernel-2025}
@@ -85,28 +132,42 @@ setup_clang() {
 			warn "master-kernel-build-2022/r450784e"
 		fi
 
-		fetch "${AOSP_CLANG_BASE}/+archive/refs/heads/${branch}/clang-${version}.tar.gz" \
-			"${WORKSPACE}/clang.tar.gz"
-		extract_archive "${WORKSPACE}/clang.tar.gz" "$CLANG_DIR"
+		local aosp_url="${AOSP_CLANG_BASE}/+archive/refs/heads/${branch}/clang-${version}.tar.gz"
+		if fetch "$aosp_url" "${WORKSPACE}/clang.tar.gz" \
+			&& extract_archive "${WORKSPACE}/clang.tar.gz" "$CLANG_DIR" \
+			&& clang_bin=$(find_clang_bin "$CLANG_DIR"); then
+			:
+		else
+			warn "AOSP clang unavailable (gitiles outage or empty archive). Retrying once, then falling back."
+			rm -rf "$CLANG_DIR"; mkdir -p "$CLANG_DIR"
+			if fetch "$aosp_url" "${WORKSPACE}/clang.tar.gz" \
+				&& extract_archive "${WORKSPACE}/clang.tar.gz" "$CLANG_DIR" \
+				&& clang_bin=$(find_clang_bin "$CLANG_DIR"); then
+				:
+			elif setup_clang_ndk_fallback "$CLANG_DIR" \
+				&& clang_bin=$(find_clang_bin "$CLANG_DIR"); then
+				warn "using NDK ${NDK_FALLBACK_VERSION} toolchain (Clang 16) instead of AOSP clang ${version}."
+			fi
+		fi
+
+		[ -n "$clang_bin" ] \
+			|| die "no usable clang. AOSP gitiles (${aosp_url}) and the NDK fallback (${NDK_FALLBACK_URL}) both failed.
+        If this is the known gitiles 503 outage, wait for it to clear, or pin a
+        working version with CLANG_NDK_VERSION."
 	fi
 
-	# The check that turns the empty-archive trap into an actionable error.
-	[ -x "${CLANG_DIR}/bin/clang" ] \
-		|| die "no usable clang at ${CLANG_DIR}/bin/clang.
-       The archive extracted to: $(ls -A "$CLANG_DIR" 2>/dev/null | head -5 | tr '\n' ' ')
-       If this was an AOSP download, that branch/version pair is a placeholder
-       with no toolchain in it. Pick a verified pair (see scripts/toolchain.sh)."
-
 	local ver
-	ver=$("${CLANG_DIR}/bin/clang" --version | head -n1)
+	ver=$("$clang_bin" --version | head -n1)
 	ok "clang ready: ${ver}"
-	export_env CLANG_PATH "${CLANG_DIR}/bin"
+	export_env CLANG_PATH "$(dirname "$clang_bin")"
 	summary "| Compiler | \`${ver}\` |"
 	endgroup
 }
 
 # AOSP's GCC 4.9 prebuilts are still the binutils of choice for pre-5.x trees
-# that cannot yet use LLVM's integrated assembler.
+# that cannot yet use LLVM's integrated assembler. When gitiles is down, the
+# GNU cross binutils from the runner image (apt) stand in: same tool
+# generation, and a kernel build only ever touches as/ld from the toolchain.
 setup_gcc() {
 	local gcc_tag=${AOSP_GCC_TAG:-android-12.1.0_r27}
 
@@ -118,10 +179,20 @@ setup_gcc() {
 	elif is_true "${ENABLE_GCC_ARM64:-false}"; then
 		group "Downloading AOSP GCC (arm64)"
 		mkdir -p "$GCC64_DIR"
-		fetch "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/${gcc_tag}.tar.gz" \
-			"${WORKSPACE}/gcc-aarch64.tar.gz"
-		extract_archive "${WORKSPACE}/gcc-aarch64.tar.gz" "$GCC64_DIR"
-		export_env GCC_64 "CROSS_COMPILE=${GCC64_DIR}/bin/aarch64-linux-android-"
+		if fetch "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/+archive/refs/tags/${gcc_tag}.tar.gz" \
+			"${WORKSPACE}/gcc-aarch64.tar.gz" \
+			&& extract_archive "${WORKSPACE}/gcc-aarch64.tar.gz" "$GCC64_DIR" \
+			&& [ -x "${GCC64_DIR}/bin/aarch64-linux-android-ld" ]; then
+			export_env GCC_64 "CROSS_COMPILE=${GCC64_DIR}/bin/aarch64-linux-android-"
+		else
+			warn "AOSP GCC (arm64) unavailable (gitiles outage?). Using system aarch64-linux-gnu binutils."
+			if ! command -v aarch64-linux-gnu-ld >/dev/null 2>&1; then
+				sudo apt-get update -qq || true
+				sudo apt-get install -y --no-install-recommends binutils-aarch64-linux-gnu \
+					|| die "cannot install binutils-aarch64-linux-gnu"
+			fi
+			export_env GCC_64 "CROSS_COMPILE=aarch64-linux-gnu-"
+		fi
 		endgroup
 	fi
 
@@ -133,10 +204,19 @@ setup_gcc() {
 	elif is_true "${ENABLE_GCC_ARM32:-false}"; then
 		group "Downloading AOSP GCC (arm32)"
 		mkdir -p "$GCC32_DIR"
-		fetch "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9/+archive/refs/tags/${gcc_tag}.tar.gz" \
-			"${WORKSPACE}/gcc-arm.tar.gz"
-		extract_archive "${WORKSPACE}/gcc-arm.tar.gz" "$GCC32_DIR"
-		export_env GCC_32 "CROSS_COMPILE_ARM32=${GCC32_DIR}/bin/arm-linux-androideabi-"
+		if fetch "https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/arm/arm-linux-androideabi-4.9/+archive/refs/tags/${gcc_tag}.tar.gz" \
+			"${WORKSPACE}/gcc-arm.tar.gz" \
+			&& extract_archive "${WORKSPACE}/gcc-arm.tar.gz" "$GCC32_DIR" \
+			&& [ -x "${GCC32_DIR}/bin/arm-linux-androideabi-ld" ]; then
+			export_env GCC_32 "CROSS_COMPILE_ARM32=${GCC32_DIR}/bin/arm-linux-androideabi-"
+		else
+			warn "AOSP GCC (arm32) unavailable (gitiles outage?). Using system arm-linux-gnueabi binutils."
+			if ! command -v arm-linux-gnueabi-ld >/dev/null 2>&1; then
+				sudo apt-get install -y --no-install-recommends binutils-arm-linux-gnueabi \
+					|| die "cannot install binutils-arm-linux-gnueabi"
+			fi
+			export_env GCC_32 "CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
+		fi
 		endgroup
 	fi
 }
