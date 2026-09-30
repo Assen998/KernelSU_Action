@@ -41,8 +41,15 @@ make_anykernel3() {
 		sed -i 's/IS_SLOT_DEVICE=0;/is_slot_device=auto;/g' "${AK3}/anykernel.sh"
 	fi
 
-	cp "${BOOT_OUT}/${KERNEL_IMAGE_NAME}" "${AK3}/" \
-		|| die "kernel image missing at ${BOOT_OUT}/${KERNEL_IMAGE_NAME}"
+	# Full boot image (MTK / full-boot workflows): the AK3 package flashes
+	# boot.img straight to the boot partition, so the raw kernel is not needed.
+	if is_true "${BUILD_BOOT_IMG:-false}" && [ -f "${WORKSPACE}/boot.img" ]; then
+		cp "${WORKSPACE}/boot.img" "${AK3}/" \
+			|| die "boot.img missing for AnyKernel3 package"
+	else
+		cp "${BOOT_OUT}/${KERNEL_IMAGE_NAME}" "${AK3}/" \
+			|| die "kernel image missing at ${BOOT_OUT}/${KERNEL_IMAGE_NAME}"
+	fi
 	if is_true "${CHECK_DTBO_IS_OK:-false}"; then
 		cp "${BOOT_OUT}/dtbo.img" "${AK3}/"
 	fi
@@ -56,11 +63,33 @@ make_boot_image() {
 	is_true "${BUILD_BOOT_IMG:-false}" || return 0
 	group "Repacking boot image"
 
+	local src_img="${WORKSPACE}/boot-source.img"
+	if [ -f "${SOURCE_BOOT_IMAGE}" ]; then
+		# A path inside the repo (e.g. boot/cannon-boot.img) -- no fetch needed.
+		cp "${SOURCE_BOOT_IMAGE}" "$src_img"
+	else
+		fetch "${SOURCE_BOOT_IMAGE:?SOURCE_BOOT_IMAGE required}" "$src_img"
+	fi
+
+	# BOOT_REPACK=mtk: MediaTek boot images use an 8-byte "ANDROID!" magic
+	# (fields shifted -8 vs AOSP) which the stock unpack_bootimg.py misparses.
+	# The in-repo repacker validates the layout and swaps in the new kernel.
+	if [ "${BOOT_REPACK:-standard}" = "mtk" ]; then
+		python3 "$(dirname "${BASH_SOURCE[0]}")/mtk_boot_repack.py" \
+			--source "$src_img" \
+			--kernel "${BOOT_OUT}/${KERNEL_IMAGE_NAME}" \
+			--output "${WORKSPACE}/boot.img" \
+			|| die "MTK boot image repack failed"
+		[ -s "${WORKSPACE}/boot.img" ] || die "boot.img was not produced"
+		ok "boot.img built ($(du -h "${WORKSPACE}/boot.img" | cut -f1))"
+		export_env MAKE_BOOT_IMAGE_IS_OK true
+		endgroup
+		return 0
+	fi
+
 	local tools="${WORKSPACE}/tools"
 	[ -x "${tools}/unpack_bootimg.py" ] || [ -f "${tools}/unpack_bootimg.py" ] \
 		|| die "mkbootimg tools not found at ${tools}"
-
-	fetch "${SOURCE_BOOT_IMAGE:?SOURCE_BOOT_IMAGE required}" "${WORKSPACE}/boot-source.img"
 
 	cd "$WORKSPACE"
 	local fmt
@@ -101,7 +130,7 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
 	case "${1:-all}" in
 		anykernel3) make_anykernel3 ;;
 		bootimg)    make_boot_image ;;
-		all)        make_anykernel3; make_boot_image; write_summary ;;
+		all)        make_boot_image; make_anykernel3; write_summary ;;
 		*) die "unknown package step '$1'" ;;
 	esac
 fi

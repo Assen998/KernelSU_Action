@@ -300,6 +300,10 @@ fetch_toolchain_generic() {
 # mkbootimg is only needed when repacking a boot image.
 setup_mkbootimg() {
 	is_true "${BUILD_BOOT_IMG:-false}" || return 0
+	if [ "${BOOT_REPACK:-standard}" = "mtk" ]; then
+		info "BOOT_REPACK=mtk: using in-repo scripts/mtk_boot_repack.py; no mkbootimg tools needed"
+		return 0
+	fi
 	group "Downloading mkbootimg tools"
 	local dir="${WORKSPACE}/tools"
 	rm -rf "$dir"

@@ -79,6 +79,9 @@ declare -A DEFAULTS=(
 	[NEED_DTBO]="false"
 	[BUILD_BOOT_IMG]="false"
 	[SOURCE_BOOT_IMAGE]=""
+	# standard = AOSP unpack_bootimg.py + mkbootimg.py; mtk = in-repo
+	# scripts/mtk_boot_repack.py for MediaTek 8-byte-magic boot images.
+	[BOOT_REPACK]="standard"
 
 	# Runner
 	[ENABLE_CCACHE]="true"
