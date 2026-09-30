@@ -32,7 +32,10 @@ declare -A DEFAULTS=(
 	# Optional explicit CONFIG_LOCALVERSION (e.g. "-perf-cus"). Wins over the
 	# default "-${KERNEL_NAME}"; set it to the stock ROM's localversion so the
 	# ROM's vendor modules' vermagic matches (mismatch = no modules = bootloop).
-	[LOCALVERSION]=""
+	# NOTE: named *_OVERRIDE on purpose -- the bare LOCALVERSION env var is
+	# owned by scripts/source.sh (kernel-tree localversion file, artifact
+	# naming) and is reset to "" when the tree has no localversion file.
+	[LOCALVERSION_OVERRIDE]=""
 	[EXTRA_CMDS]=""
 	[CUSTOM_CMDS]=""
 
