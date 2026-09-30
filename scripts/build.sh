@@ -77,8 +77,14 @@ prepare_defconfig() {
 
 	# A stable LOCALVERSION keeps artifact names predictable. Without this the
 	# tree appends "-dirty" as soon as any patch above touches a tracked file.
-	if [ -n "${KERNEL_NAME:-}" ]; then
-		kconf_set "$DEFCONFIG_PATH" CONFIG_LOCALVERSION "\"-${KERNEL_NAME}\""
+	# LOCALVERSION (config override) wins when set: matching the stock ROM's
+	# localversion keeps UTS_RELEASE/vermagic identical, so the ROM's vendor
+	# kernel modules load (a mismatched vermagic rejects every module and
+	# bootloops the device).
+	local lv="-${KERNEL_NAME}"
+	[ -n "${LOCALVERSION:-}" ] && lv="$LOCALVERSION"
+	if [ -n "${lv}" ]; then
+		kconf_set "$DEFCONFIG_PATH" CONFIG_LOCALVERSION "\"${lv}\""
 		if [ -f "${KERNEL_DIR}/scripts/setlocalversion" ]; then
 			sed -i 's/echo "\$res"/echo "\$res"/; s/-dirty//g' "${KERNEL_DIR}/scripts/setlocalversion"
 		fi

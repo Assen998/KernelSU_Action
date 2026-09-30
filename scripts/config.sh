@@ -29,6 +29,10 @@ declare -A DEFAULTS=(
 	[ARCH]="arm64"
 	[KERNEL_NAME]=""
 	[ADD_LOCALVERSION_TO_FILENAME]="false"
+	# Optional explicit CONFIG_LOCALVERSION (e.g. "-perf-cus"). Wins over the
+	# default "-${KERNEL_NAME}"; set it to the stock ROM's localversion so the
+	# ROM's vendor modules' vermagic matches (mismatch = no modules = bootloop).
+	[LOCALVERSION]=""
 	[EXTRA_CMDS]=""
 	[CUSTOM_CMDS]=""
 
