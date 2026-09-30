@@ -56,6 +56,7 @@ def main():
     ap.add_argument("--source", required=True, help="original MTK boot image")
     ap.add_argument("--kernel", required=True, help="new kernel blob (e.g. Image.gz)")
     ap.add_argument("--output", required=True, help="output boot image")
+    ap.add_argument("--ramdisk", help="new ramdisk blob (gzipped cpio); replaces the source ramdisk")
     a = ap.parse_args()
 
     try:
@@ -63,6 +64,15 @@ def main():
         newk = open(a.kernel, "rb").read()
     except OSError as e:
         sys.exit(f"cannot read input: {e}")
+    if a.ramdisk:
+        try:
+            newr = open(a.ramdisk, "rb").read()
+        except OSError as e:
+            sys.exit(f"cannot read input: {e}")
+        if not newr or newr[:2] != b"\x1f\x8b":
+            sys.exit("new ramdisk blob is empty or not gzip")
+    else:
+        newr = None
 
     if src[:8] != MAGIC:
         sys.exit(f"not an Android boot image (magic {src[:8]!r})")
@@ -94,20 +104,34 @@ def main():
         sys.exit(f"ramdisk at {r0:#x} is not gzip (magic {src[r0:r0+4].hex()}); "
                  "unexpected MTK header layout")
 
-    ramdisk = src[r0:r0 + rs]
+    ramdisk = newr if newr is not None else src[r0:r0 + rs]
     cmdline = src[0x40:HDR_SIZE].split(b"\x00")[0].decode(errors="replace")
 
     out = bytearray()
     out += MAGIC
     hdr_fields = bytearray(src[8:48])          # the 10 u32 fields
     struct.pack_into("<I", hdr_fields, 0, len(newk))
+    struct.pack_into("<I", hdr_fields, 8, len(ramdisk))
     out += hdr_fields
     out += src[48:64]                          # name[16]
     out += src[64:HDR_SIZE]                    # cmdline[512]
-    out += b"\x00" * (k0 - HDR_SIZE)           # header padding
+    # MTK LK uses the 0x240..page region for its own data (an extended header:
+    # a 20-byte hash-like field at 0x240 plus descriptor words around 0x66c,
+    # incl. a DRAM address at 0x674). Zeroing it makes LK crash with
+    # bootreason=lk_crash before the Linux kernel starts. Preserve verbatim.
+    out += src[HDR_SIZE:k0]
     out += newk
     out += b"\x00" * (page_align(k0 + len(newk), page) - (k0 + len(newk)))
     out += ramdisk
+    # Preserve the source file's tail (bytes after its ramdisk end). MTK
+    # builds leave non-zero data there and the file is padded to the full
+    # partition size (64MB on cannon); keeping the tail verbatim makes a
+    # same-size repack byte-exact.
+    src_tail = src[r0 + rs:]
+    if len(out) + len(src_tail) == len(src):
+        out += src_tail
+    elif len(out) < len(src):
+        out += b"\x00" * (len(src) - len(out))
 
     with open(a.output, "wb") as f:
         f.write(bytes(out))
