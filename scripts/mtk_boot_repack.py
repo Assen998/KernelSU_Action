@@ -104,6 +104,18 @@ def main():
         sys.exit(f"ramdisk at {r0:#x} is not gzip (magic {src[r0:r0+4].hex()}); "
                  "unexpected MTK header layout")
 
+    # A kernel blob SMALLER than the source's gets zero-padded to the
+    # source's kernel_size: the gzip stream ends at its own trailer and the
+    # trailing zeros are never fed to the inflate, while the ramdisk and
+    # everything after it land at the source's exact offsets -- so the tail
+    # (which contains the DTB LK reads, see below) is preserved verbatim.
+    # Verified working on cannon (LOS 19.1/20, kernel 4.14.336 + KSU).
+    if len(newk) < ks:
+        print(f"kernel blob {len(newk)} < source kernel_size {ks}: padding "
+              f"blob with {ks - len(newk)} zeros so the tail (DTB) keeps "
+              f"its original offsets")
+        newk = newk + b"\x00" * (ks - len(newk))
+
     ramdisk = newr if newr is not None else src[r0:r0 + rs]
     cmdline = src[0x40:HDR_SIZE].split(b"\x00")[0].decode(errors="replace")
 
@@ -124,14 +136,34 @@ def main():
     out += b"\x00" * (page_align(k0 + len(newk), page) - (k0 + len(newk)))
     out += ramdisk
     # Preserve the source file's tail (bytes after its ramdisk end). MTK
-    # builds leave non-zero data there and the file is padded to the full
-    # partition size (64MB on cannon); keeping the tail verbatim makes a
-    # same-size repack byte-exact.
+    # boot images keep the DTB (fdt, d00dfeed magic) there -- LK reads it
+    # from the boot image and passes it to the kernel; zeroing it makes LK
+    # crash with bootreason=lk_crash before Linux starts. THIS was the
+    # cannon bootloop root cause (kernel size / gzip encoding / the 20-byte
+    # 0x240 field were all red herrings: a 42.5MB-inflated stock kernel
+    # boots fine, and a stock kernel with the 0x240 field zeroed boots).
     src_tail = src[r0 + rs:]
     if len(out) + len(src_tail) == len(src):
+        # Same-size kernel: the whole tail (DTB included) is verbatim.
         out += src_tail
-    elif len(out) < len(src):
-        out += b"\x00" * (len(src) - len(out))
+    else:
+        # Kernel size differs: the ramdisk shifted, so the source tail
+        # cannot be copied verbatim. Relocate the DTB right after the new
+        # ramdisk at the same page-aligned +0x40 offset both stock images
+        # use (LOS 19.1: 0x11f7840 = page+0x40; LOS 20: 0xce4040 = page+0x40),
+        # keep the remaining tail bytes after it, zero-fill the rest.
+        dtb_off = src.find(b"\xd0\x0d\xfe\xed", r0 + rs)
+        if dtb_off >= 0:
+            dtb_total = struct.unpack_from(">I", src, dtb_off + 4)[0]
+            if 0 < dtb_total <= len(src) - dtb_off:
+                new_r_end = len(out)
+                out += b"\x00" * (page_align(new_r_end, page) - new_r_end)
+                out += b"\x00" * 0x40
+                out += src[dtb_off:dtb_off + dtb_total]
+                out += src[dtb_off + dtb_total:]
+                print(f"  dtb         : {dtb_total} bytes relocated after ramdisk")
+        if len(out) < len(src):
+            out += b"\x00" * (len(src) - len(out))
 
     with open(a.output, "wb") as f:
         f.write(bytes(out))

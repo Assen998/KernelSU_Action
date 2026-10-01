@@ -75,15 +75,12 @@ make_boot_image() {
 	# (fields shifted -8 vs AOSP) which the stock unpack_bootimg.py misparses.
 	# The in-repo repacker validates the layout and swaps in the new kernel.
 	if [ "${BOOT_REPACK:-standard}" = "mtk" ]; then
-		# MTK LK inflates the kernel into a buffer sized for the STOCK
-		# kernel; a larger kernel crashes LK (bootreason=lk_crash). Gate the
-		# inflated size and pad up to the stock size when needed.
-		if [ -n "${STOCK_KERNEL_INFLATED_SIZE:-}" ]; then
-			python3 "$(dirname "${BASH_SOURCE[0]}")/mtk_kernel_gate.py" \
-				--kernel "${BOOT_OUT}/${KERNEL_IMAGE_NAME}" \
-				--target "${STOCK_KERNEL_INFLATED_SIZE}" \
-				|| die "kernel too large for MTK LK (see mtk_kernel_gate output)"
-		fi
+		# NOTE: no kernel-size gate here. The old gate was based on a
+		# disproven theory: MTK LK has NO inflated-size limit (a stock
+		# kernel inflating to 42.5MB boots fine on cannon). The real
+		# constraint is the DTB in the source image's tail, which the
+		# repacker now preserves for any kernel size (blob padding or
+		# DTB relocation, see mtk_boot_repack.py).
 		python3 "$(dirname "${BASH_SOURCE[0]}")/mtk_boot_repack.py" \
 			--source "$src_img" \
 			--kernel "${BOOT_OUT}/${KERNEL_IMAGE_NAME}" \

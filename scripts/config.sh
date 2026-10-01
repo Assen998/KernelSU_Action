@@ -36,13 +36,6 @@ declare -A DEFAULTS=(
 	# owned by scripts/source.sh (kernel-tree localversion file, artifact
 	# naming) and is reset to "" when the tree has no localversion file.
 	[LOCALVERSION_OVERRIDE]=""
-	# MTK only: stock kernel's INFLATED size in bytes. MTK LK inflates the
-	# boot kernel into a buffer sized for the stock kernel -- anything larger
-	# crashes LK (bootreason=lk_crash, boot loop). When set, the packaging
-	# step fails the build if the kernel is larger, and pads it with zeros up
-	# to exactly this size (the ARM64 Image ignores trailing zeros) so LK's
-	# buffer and/or exact-size checks are satisfied.
-	[STOCK_KERNEL_INFLATED_SIZE]=""
 	[EXTRA_CMDS]=""
 	[CUSTOM_CMDS]=""
 
