@@ -60,3 +60,22 @@ boot-completed 各阶段 exec /data/adb/ksu/bin/ksud → ksud 挂载模块并执
 - ksu-push/config.env — sagit Android 15 配置（lineage-22.2 分支）
 - adb-wifi-boot/ + github.com/Assen998/adb-wifi-boot — ADB over WiFi 开机模块
 - boot/cannon-boot.img（LOS 20）与 boot/cannon-boot-los191.img（LOS 19.1）— 重打包源
+
+## Mi 6 (sagit, 4.4.302) 容器崩溃与修复（2026-10-03）
+
+- 现象：Droidspaces 手动启动容器 → 卡死重启。pstore (console-ramoops) 里
+  `Kernel panic - not syncing: Fatal exception`，崩溃点 sget_userns+0xcc：
+  `ldaxr` 打在损坏指针（0x3e01... 而非 0xffffff...，未对齐）→ alignment fault。
+  调用链 unshare(CLONE_NEWIPC) → create_new_namespaces → copy_ipcs → mq_init_ns
+  → mqueue_mount → mount_fs → sget_userns。红米 4.14 同路径正常 → 4.4 独有 bug。
+- 根因：stock sagit_defconfig 没有 POSIX_MQUEUE/USER_NS/IPC_NS，都是我们 EXTRA
+  加的，把 4.4 的 mqueue 命名空间 bug 暴露了出来。
+- 陷阱：init/Kconfig `config IPC_NS depends on (SYSVIPC || POSIX_MQUEUE)`。只关
+  POSIX_MQUEUE=n 会连带把 IPC_NS 静默丢弃（SYSVIPC 也没开）→「IPC 命名空间不可用」。
+- 最终配置：`CONFIG_SYSVIPC=y` + `CONFIG_POSIX_MQUEUE=n`（见 config-los191-sagit.env）。
+  SYSVIPC 满足 IPC_NS 依赖（sem/msg/shm 正常），mqueue 走 include/linux/ipc_namespace.h
+  的 inline 空桩、崩溃路径不触发。验证：ikconfig 里 CONFIG_IPC_NS=y / CONFIG_SYSVIPC=y /
+  # CONFIG_POSIX_MQUEUE is not set。
+- LOS 19.1 sagit 开机「内部错误」= vendor SPL (2019-09-01) 比 system SPL (2022-12-05)
+  旧 3 年（logcat: `Build: Vendor interface is incompatible, error=1`），ROM 本身的老问题、
+  无害，与内核无关，用户选择忽略。
